@@ -30,21 +30,80 @@ func newNode[K cmp.Ordered, V any](key K, value V, level int) *Node[K, V] {
 
 // SkipList 跳表结构
 type SkipList[K cmp.Ordered, V any] struct {
-	head    *Node[K, V]
-	level   int // 当前最大有效层数
-	randGen *rand.Rand
-	mu      sync.RWMutex // 2. 在跳表主体中加入读写锁
+	head     *Node[K, V]
+	level    int // 当前最大有效层数
+	randGen  *rand.Rand
+	mu       sync.RWMutex // 2. 在跳表主体中加入读写锁
+	nodePool sync.Pool    // 1. 新增：节点对象池
 }
 
 // NewSkipList 初始化跳表
 func NewSkipList[K cmp.Ordered, V any]() *SkipList[K, V] {
 	source := rand.NewSource(time.Now().UnixNano())
-	return &SkipList[K, V]{
-		// 头节点不存储实际数据，层数直接拉满
-		head:    newNode(*new(K), *new(V), maxLevel),
+	sl := &SkipList[K, V]{
 		level:   1,
 		randGen: rand.New(source),
 	}
+
+	// 2. 初始化对象池的“工厂函数”
+	sl.nodePool.New = func() any {
+		// 【神仙细节 1】：直接分配底层容量为 maxLevel 的切片。
+		// 以后不管这个节点是 1 层还是 32 层，底层数组都不需要重新扩容了！
+		return &Node[K, V]{
+			Forward: make([]*Node[K, V], maxLevel),
+		}
+	}
+
+	// 3. 初始化头节点 (直接从池子里捞一个)
+	sl.head = sl.nodePool.Get().(*Node[K, V])
+	// 头节点必须保持最高层级
+	sl.head.Forward = sl.head.Forward[:maxLevel]
+	// 确保指针干净
+	for i := 0; i < maxLevel; i++ {
+		sl.head.Forward[i] = nil
+	}
+
+	return sl
+}
+
+// allocNode 从对象池获取一个节点并初始化
+func (sl *SkipList[K, V]) allocNode(key K, value V, level int) *Node[K, V] {
+	// 从池子里捞出来，并做类型断言
+	node := sl.nodePool.Get().(*Node[K, V])
+
+	node.Key = key
+	node.Value = value
+
+	// 【神仙细节 2】：利用 Go 的切片特性，把视图裁切到当前需要的 level。
+	// 但底层数组依然是 maxLevel 长度，完美复用内存。
+	node.Forward = node.Forward[:level]
+
+	// 清理上一任遗留的指针，防止引用错乱
+	for i := 0; i < level; i++ {
+		node.Forward[i] = nil
+	}
+
+	return node
+}
+
+// freeNode 回收节点到对象池
+func (sl *SkipList[K, V]) freeNode(node *Node[K, V]) {
+	// 【致命防坑】：必须要清空 Key 和 Value！
+	// 如果 V 是一个巨大的结构体指针，你不置空，这个节点被池子引用着，
+	// 原来的大对象就永远无法被 GC，这就成了严重的内存泄漏。
+	var zeroK K
+	var zeroV V
+	node.Key = zeroK
+	node.Value = zeroV
+
+	// 把切片视图恢复到最大，并清空所有悬空指针
+	node.Forward = node.Forward[:maxLevel]
+	for i := 0; i < maxLevel; i++ {
+		node.Forward[i] = nil
+	}
+
+	// 洗白白之后，扔回池子
+	sl.nodePool.Put(node)
 }
 
 // randomLevel 生成随机层数
@@ -116,7 +175,7 @@ func (sl *SkipList[K, V]) Insert(key K, value V) {
 	}
 
 	// 4. 创建新节点并调整指针
-	newNode := newNode(key, value, newLevel)
+	newNode := sl.allocNode(key, value, newLevel) // 走对象池分配
 	for i := 0; i < newLevel; i++ {
 		newNode.Forward[i] = update[i].Forward[i]
 		update[i].Forward[i] = newNode
@@ -158,6 +217,7 @@ func (sl *SkipList[K, V]) Delete(key K) bool {
 		sl.level--
 	}
 
+	sl.freeNode(curr)
 	// 注意：这里不需要手动 delete(curr)，一旦没有指针指向它，Go 的 GC 会自动回收它。
 	return true
 }
