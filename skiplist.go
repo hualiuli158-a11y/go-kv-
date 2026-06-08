@@ -1,40 +1,38 @@
 package main
 
 import (
+	"bufio"
 	"cmp"
+	"fmt"
 	"math/rand"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
 	maxLevel    = 32   // 跳表最大层数
-	probability = 0.25 // 节点晋升的概率 (通常为 1/4)
+	probability = 0.25 // 节点晋升的概率
 )
 
-// Node 跳表节点，K 需要支持比较大小，V 可以是任意类型
+// Node 跳表节点
 type Node[K cmp.Ordered, V any] struct {
 	Key     K
 	Value   V
-	Forward []*Node[K, V] // 替代了复杂的 Node**，直接用切片管理多层指针
-}
-
-// newNode 创建新节点
-func newNode[K cmp.Ordered, V any](key K, value V, level int) *Node[K, V] {
-	return &Node[K, V]{
-		Key:     key,
-		Value:   value,
-		Forward: make([]*Node[K, V], level),
-	}
+	Forward []*Node[K, V]
 }
 
 // SkipList 跳表结构
 type SkipList[K cmp.Ordered, V any] struct {
 	head     *Node[K, V]
-	level    int // 当前最大有效层数
+	level    int
 	randGen  *rand.Rand
-	mu       sync.RWMutex // 2. 在跳表主体中加入读写锁
-	nodePool sync.Pool    // 1. 新增：节点对象池
+	mu       sync.RWMutex
+	nodePool sync.Pool
+
+	aofFile *os.File
+	aofChan chan string
 }
 
 // NewSkipList 初始化跳表
@@ -45,110 +43,137 @@ func NewSkipList[K cmp.Ordered, V any]() *SkipList[K, V] {
 		randGen: rand.New(source),
 	}
 
-	// 2. 初始化对象池的“工厂函数”
 	sl.nodePool.New = func() any {
-		// 【神仙细节 1】：直接分配底层容量为 maxLevel 的切片。
-		// 以后不管这个节点是 1 层还是 32 层，底层数组都不需要重新扩容了！
 		return &Node[K, V]{
 			Forward: make([]*Node[K, V], maxLevel),
 		}
 	}
 
-	// 3. 初始化头节点 (直接从池子里捞一个)
 	sl.head = sl.nodePool.Get().(*Node[K, V])
-	// 头节点必须保持最高层级
 	sl.head.Forward = sl.head.Forward[:maxLevel]
-	// 确保指针干净
 	for i := 0; i < maxLevel; i++ {
 		sl.head.Forward[i] = nil
 	}
 
+	// 1. 打开 AOF 文件
+	file, err := os.OpenFile("aof.log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		panic(fmt.Sprintf("无法打开 AOF 文件: %v", err))
+	}
+	sl.aofFile = file
+
+	// 2. 先从 AOF 恢复数据 (此时 aofChan 还是 nil，Insert 时不会触发重复写磁盘)
+	sl.loadAOF()
+
+	// 3. 恢复完成后，再初始化 Channel 并启动 Worker
+	sl.aofChan = make(chan string, 100000)
+	go sl.aofWorker()
+
 	return sl
+}
+
+// loadAOF 逐行读取并重放指令
+func (sl *SkipList[K, V]) loadAOF() {
+	sl.aofFile.Seek(0, 0)
+	scanner := bufio.NewScanner(sl.aofFile)
+
+	count := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, " ", 3)
+		if len(parts) == 0 {
+			continue
+		}
+
+		switch parts[0] {
+		case "SET":
+			if len(parts) == 3 {
+				// 这里的断言要求外部调用时泛型必须是 [string, string]
+				sl.Insert(any(parts[1]).(K), any(parts[2]).(V))
+				count++
+			}
+		case "DEL":
+			if len(parts) == 2 {
+				sl.Delete(any(parts[1]).(K))
+				count++
+			}
+		}
+	}
+	fmt.Printf("AOF 恢复完成，共重放 %d 条指令\n", count)
+}
+
+// aofWorker 后台异步刷盘协程
+func (sl *SkipList[K, V]) aofWorker() {
+	for cmd := range sl.aofChan {
+		_, err := sl.aofFile.WriteString(cmd + "\n")
+		if err != nil {
+			fmt.Printf("AOF 写入失败: %v\n", err)
+		}
+	}
 }
 
 // allocNode 从对象池获取一个节点并初始化
 func (sl *SkipList[K, V]) allocNode(key K, value V, level int) *Node[K, V] {
-	// 从池子里捞出来，并做类型断言
 	node := sl.nodePool.Get().(*Node[K, V])
-
 	node.Key = key
 	node.Value = value
-
-	// 【神仙细节 2】：利用 Go 的切片特性，把视图裁切到当前需要的 level。
-	// 但底层数组依然是 maxLevel 长度，完美复用内存。
 	node.Forward = node.Forward[:level]
-
-	// 清理上一任遗留的指针，防止引用错乱
 	for i := 0; i < level; i++ {
 		node.Forward[i] = nil
 	}
-
 	return node
 }
 
 // freeNode 回收节点到对象池
 func (sl *SkipList[K, V]) freeNode(node *Node[K, V]) {
-	// 【致命防坑】：必须要清空 Key 和 Value！
-	// 如果 V 是一个巨大的结构体指针，你不置空，这个节点被池子引用着，
-	// 原来的大对象就永远无法被 GC，这就成了严重的内存泄漏。
 	var zeroK K
 	var zeroV V
 	node.Key = zeroK
 	node.Value = zeroV
-
-	// 把切片视图恢复到最大，并清空所有悬空指针
 	node.Forward = node.Forward[:maxLevel]
 	for i := 0; i < maxLevel; i++ {
 		node.Forward[i] = nil
 	}
-
-	// 洗白白之后，扔回池子
 	sl.nodePool.Put(node)
 }
 
 // randomLevel 生成随机层数
 func (sl *SkipList[K, V]) randomLevel() int {
 	level := 1
-	// 每次有 25% 的概率晋升到下一层
 	for sl.randGen.Float32() < probability && level < maxLevel {
 		level++
 	}
 	return level
 }
 
-// Search 查找键值，返回 Value 和 是否存在的布尔值
+// Search 查找键值
 func (sl *SkipList[K, V]) Search(key K) (V, bool) {
-	sl.mu.RLock()         // 1. 加读锁（多个 Goroutine 可以同时获取读锁进入该临界区）
-	defer sl.mu.RUnlock() // 2. 函数执行完毕或发生异常退出时，自动释放读锁
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
 
 	curr := sl.head
-	// 从最高层开始往下找
 	for i := sl.level - 1; i >= 0; i-- {
-		// 在当前层向右遍历，直到遇到大于等于目标 key 的节点
 		for curr.Forward[i] != nil && curr.Forward[i].Key < key {
 			curr = curr.Forward[i]
 		}
 	}
 
-	// 降到第 0 层，curr 的下一个节点就是可能的目标
 	curr = curr.Forward[0]
 	if curr != nil && curr.Key == key {
 		return curr.Value, true
 	}
 
-	var zero V // 返回零值
+	var zero V
 	return zero, false
 }
 
 // Insert 插入或更新键值对
 func (sl *SkipList[K, V]) Insert(key K, value V) {
-	sl.mu.Lock()         // 1. 加写锁（排他锁，其他读写操作必须等待）
-	defer sl.mu.Unlock() // 2. 函数退出时自动释放写锁
-	// update 数组用于记录每一层向下拐弯的节点
+	sl.mu.Lock()
+
 	update := make([]*Node[K, V], maxLevel)
 	curr := sl.head
 
-	// 1. 寻找插入位置并记录路径
 	for i := sl.level - 1; i >= 0; i-- {
 		for curr.Forward[i] != nil && curr.Forward[i].Key < key {
 			curr = curr.Forward[i]
@@ -158,38 +183,44 @@ func (sl *SkipList[K, V]) Insert(key K, value V) {
 
 	curr = curr.Forward[0]
 
-	// 2. 如果 Key 已存在，直接更新 Value
 	if curr != nil && curr.Key == key {
 		curr.Value = value
+		sl.mu.Unlock() // 提前解锁，防止死锁
+		if sl.aofChan != nil {
+			sl.aofChan <- fmt.Sprintf("SET %v %v", key, value)
+		}
 		return
 	}
 
-	// 3. 生成新节点的随机层数
 	newLevel := sl.randomLevel()
 	if newLevel > sl.level {
-		// 如果新层数超过了当前跳表的最大层数，超出的部分由 head 指向它
 		for i := sl.level; i < newLevel; i++ {
 			update[i] = sl.head
 		}
 		sl.level = newLevel
 	}
 
-	// 4. 创建新节点并调整指针
-	newNode := sl.allocNode(key, value, newLevel) // 走对象池分配
+	newNode := sl.allocNode(key, value, newLevel)
 	for i := 0; i < newLevel; i++ {
 		newNode.Forward[i] = update[i].Forward[i]
 		update[i].Forward[i] = newNode
+	}
+
+	sl.mu.Unlock() // 释放写锁
+
+	// Channel 发送放在锁外，不阻塞其他协程
+	if sl.aofChan != nil {
+		sl.aofChan <- fmt.Sprintf("SET %v %v", key, value)
 	}
 }
 
 // Delete 删除节点
 func (sl *SkipList[K, V]) Delete(key K) bool {
-	sl.mu.Lock()         // 1. 加写锁
-	defer sl.mu.Unlock() // 2. 函数退出时自动释放写锁
+	sl.mu.Lock()
+
 	update := make([]*Node[K, V], maxLevel)
 	curr := sl.head
 
-	// 1. 寻找待删除节点并记录路径
 	for i := sl.level - 1; i >= 0; i-- {
 		for curr.Forward[i] != nil && curr.Forward[i].Key < key {
 			curr = curr.Forward[i]
@@ -199,12 +230,11 @@ func (sl *SkipList[K, V]) Delete(key K) bool {
 
 	curr = curr.Forward[0]
 
-	// 如果找不到目标节点，直接返回
 	if curr == nil || curr.Key != key {
+		sl.mu.Unlock() // 没找到直接解锁返回
 		return false
 	}
 
-	// 2. 调整指针，绕过该节点
 	for i := 0; i < sl.level; i++ {
 		if update[i].Forward[i] != curr {
 			break
@@ -212,12 +242,16 @@ func (sl *SkipList[K, V]) Delete(key K) bool {
 		update[i].Forward[i] = curr.Forward[i]
 	}
 
-	// 3. 更新跳表的当前有效层数 (如果最高层变空了，就降级)
 	for sl.level > 1 && sl.head.Forward[sl.level-1] == nil {
 		sl.level--
 	}
 
 	sl.freeNode(curr)
-	// 注意：这里不需要手动 delete(curr)，一旦没有指针指向它，Go 的 GC 会自动回收它。
+	sl.mu.Unlock() // 释放锁
+
+	// 确实删除了，发送日志
+	if sl.aofChan != nil {
+		sl.aofChan <- fmt.Sprintf("DEL %v", key)
+	}
 	return true
 }
